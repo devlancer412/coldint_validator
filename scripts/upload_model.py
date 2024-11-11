@@ -152,8 +152,8 @@ async def main(config: bt.config):
             bt.logging.warning(f'Model valid in competition {args.competition}')
 
         # First make repo and set to private; otherwise existing repos will remain public
-        huggingface_hub.create_repo(config.hf_repo_id, private=True, exist_ok=True)
-        huggingface_hub.update_repo_visibility(config.hf_repo_id, private=True)
+        # huggingface_hub.create_repo(config.hf_repo_id, private=True, exist_ok=True)
+        # huggingface_hub.update_repo_visibility(config.hf_repo_id, private=True)
 
         tokenizer = None
         try:

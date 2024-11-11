@@ -36,16 +36,19 @@ from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModel
 from model.storage.model_metadata_store import ModelMetadataStore
 from model.storage.remote_model_store import RemoteModelStore
 import bittensor as bt
-from transformers import PreTrainedModel
+from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
+from collections import OrderedDict
 from utilities import utils
 import datetime as dt
+
+import torch.nn.functional as F
 
 from dotenv import load_dotenv
 
 load_dotenv()  # take environment variables from .env.
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # === Config ===
 def get_config():
@@ -78,29 +81,6 @@ def get_config():
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="The device on which to run. cpu or cuda",
-    )
-    parser.add_argument(
-        "--load_best",
-        action="store_true",
-        help="If set, the miner loads the best model from wandb to train off.",
-    )
-    parser.add_argument(
-        "--load_uid",
-        type=int,
-        default=None,
-        help="If passed loads the model under the specified uid.",
-    )
-    parser.add_argument(
-        "--load_model_dir",
-        type=str,
-        default=None,
-        help="If provided, loads a previously trained HF model from the specified directory",
-    )
-    parser.add_argument(
-        "--load_model",
-        type=str,
-        default=None,
-        help="If provided, loads the safetensor serialized model from the specified file."
     )
     parser.add_argument(
         "--num_epochs",
@@ -152,61 +132,29 @@ def get_config():
 
     return config
 
-
 async def load_starting_model(
-    config: bt.config,
-    metagraph: bt.metagraph,
-    metadata_store: ModelMetadataStore,
-    remote_model_store: RemoteModelStore,
-) -> PreTrainedModel:
+    path: str
+) -> LlamaForCausalLM:
     """Loads the model to train based on the provided config."""
-
-    # Initialize the model based on the best on the network.
-    if config.load_best:
-        # Get the best UID be incentive and load it.
-        best_uid = model.best_uid(metagraph)
-        model = await model.load_remote_model(
-            best_uid,
-            config.model_dir,
-            metagraph,
-            metadata_store,
-            remote_model_store,
-        )
-        bt.logging.success(
-            f"Training with model from best uid: {best_uid}. Model={str(model)}"
-        )
+    
+    try:
+        model = LlamaForCausalLM.from_pretrained(path)
+        return model
+    except:
+        model = LlamaForCausalLM.from_pretrained("luaqi/sn29_back_v16")
         return model
 
-    # Initialize the model based on a passed uid.
-    if config.load_uid is not None:
-        # Sync the state from the passed uid.
-        model = await model.load_remote_model(
-            config.load_uid,
-            config.model_dir,
-            metagraph,
-            metadata_store,
-            remote_model_store,
-        )
-        bt.logging.success(
-            f"Training with model from uid: {config.load_uid}. Model={str(model)}"
-        )
-        return model
-
-    # Check if we should load a model from a local directory.
-    if config.load_model_dir:
-        model = model.load_local_model(config.load_model_dir)
-        bt.logging.success(f"Training with model from disk. Model={str(model)}")
-        return model
-
-    # Check if we should load a model from a local file.
-    if config.load_model:
-        model = model.load_gpt2_model(config.load_model)
-        bt.logging.success(f"Training with model from disk. Model={str(model)}")
-        return model
-
-    bt.logging.error("Please provide a starting model")
-    return None
-
+async def load_starting_tokenizer(
+    path: str
+) -> AutoTokenizer:
+    """Loads the model to train based on the provided config."""
+    
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        return tokenizer
+    except:
+        tokenizer = AutoTokenizer.from_pretrained("luaqi/sn29_v33")
+        return tokenizer
 
 async def main(config: bt.config):
     bt.logging(config=config)
@@ -220,8 +168,12 @@ async def main(config: bt.config):
 
     # Create a unique run id for this run.
     run_id = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    model_dir = model_utils.model_path(config.model_dir, run_id)
+    # model_dir = model_utils.model_path(config.model_dir, run_id)
+    model_dir = f"/workspace/models/{config.model_dir}"
+    tokenizer_dir = f"/workspace/tokenizers/{config.model_dir}"
+
     os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(tokenizer_dir, exist_ok=True)
 
     use_wandb = False
     if not config.offline:
@@ -233,17 +185,17 @@ async def main(config: bt.config):
             use_wandb = True
 
     # Init model.
-    metadata_store = ChainModelMetadataStore(subtensor, None, config.netuid)
-    model: PreTrainedModel = await load_starting_model(
-        config, metagraph, metadata_store, remote_store
-    )
-    if model is None:
+    # metadata_store = ChainModelMetadataStore(subtensor, None, config.netuid)
+    model: LlamaForCausalLM = await load_starting_model(model_dir)
+    tokenizer: AutoTokenizer = await load_starting_tokenizer(tokenizer_dir)
+    if model is None or tokenizer is None:
         return False
     model = model.train()
     model = model.to(config.device)
 
     bt.logging.success(f"Saving model to path: {model_dir}.")
-    model.save(model, model_dir)
+    model_utils.save(model, model_dir)
+    model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
     # Build optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wdecay)
@@ -273,7 +225,7 @@ async def main(config: bt.config):
 
         # At the end of the run, upload the model to wandb, for debugging purposes only.
         # This is not seen by validators.
-        wandb_run.save(os.path.join(model_dir, "*"), base_path=model_dir, policy="end")
+        wandb_run.save(os.path.join(model_dir, "*.*"), base_path=model_dir, policy="end")
     else:
         bt.logging.warning(
             "Not posting run to wandb. Either --offline is specified or the wandb settings are missing."
@@ -284,7 +236,6 @@ async def main(config: bt.config):
     global_step = 0
     n_acc_steps = 0
     accumulation_steps = config.accumulation_steps
-    tokenizer = model_utils.get_tokenizer()
 
     try:
         while epoch_step < config.num_epochs or config.num_epochs == -1:
@@ -308,33 +259,39 @@ async def main(config: bt.config):
             optimizer.zero_grad()  # Initialize gradients to zero
 
             for i, batch in enumerate(loader):
-                # Move the input batch to the device
-                inputs = batch.to(model.device)
+                input_ids = batch.to(model.device)
 
-                # Forward pass: compute the model output and loss
-                outputs = model(inputs, labels=inputs)
+                outputs = model(input_ids=input_ids)
+                logits = outputs.logits  # Obtain logits from model output
 
-                loss = outputs.loss / accumulation_steps  # Scale loss
+                # Shift logits and labels for language modeling
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = input_ids[..., 1:].contiguous()
+
+                # Calculate the loss manually
+                loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                loss = loss / accumulation_steps
+                
+                del shift_logits, shift_labels, outputs  # Free unused memory
+                
                 loss.backward()  # Accumulate gradients
 
                 if (i + 1) % accumulation_steps == 0:
                     n_acc_steps += 1
                     optimizer.step()  # Perform a single optimization step
                     optimizer.zero_grad()  # Clear gradients
-                    bt.logging.success(
-                        f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
-                    )
+                    
+                    logged_loss = loss.detach().item()
+                    bt.logging.success(f"Step: {n_acc_steps} loss: {logged_loss}")
                     if use_wandb:
-                        wandb_run.log(
-                            {"loss": outputs.loss.detach(), "n_batches": n_batches},
-                            step=n_acc_steps,
-                        )
-
+                        wandb_run.log({"loss": logged_loss, "n_batches": n_batches}, step=n_acc_steps)
+            
+                del loss  # Free unused memory
                 torch.cuda.empty_cache()
 
                 n_batches += 1
                 global_step += 1
-                epoch_loss += outputs.loss.detach().item()
+                epoch_loss += loss.detach().item()
 
             # Calculate the average loss for the epoch
             avg_loss = epoch_loss / n_batches
@@ -345,10 +302,17 @@ async def main(config: bt.config):
 
             if (epoch_step % config.save_interval) == 0:
                 bt.logging.success(f"Saving model to path: {model_dir}.")
-                model.save(model, model_dir)
+                model_utils.save(model, model_dir)
+                model_utils.save_tokenizer(tokenizer, tokenizer_dir)
+
+                model_size_mb = os.path.getsize(model_dir) / (1024 * 1024)
+                wandb_run.log({
+                    "model_size_mb": model_size_mb
+                })
 
         bt.logging.success(f"Finished training, saving model to {model_dir}")
-        model.save(model, model_dir)
+        model_utils.save(model, model_dir)
+        model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
     finally:
         # Important step.
@@ -357,8 +321,8 @@ async def main(config: bt.config):
 
 
 if __name__ == "__main__":
-    print('NOTICE: The base miner is left in this codebase for reference only. Remove this line if you want to actually run it.')
-    sys.exit(-1)
+    # print('NOTICE: The base miner is left in this codebase for reference only. Remove this line if you want to actually run it.')
+    # sys.exit(-1)
     # Parse and print configuration
     config = get_config()
     print(config)

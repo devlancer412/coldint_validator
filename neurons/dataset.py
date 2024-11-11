@@ -41,7 +41,7 @@ class SubsetFineWebEdu2Loader(IterableDataset):
         self,
         batch_size=None,
         sequence_length=None,
-        num_pages=None,
+        num_pages=10,
         num_rows_per_page=100,
         tokenizer: AutoTokenizer=None,
         pack=True,

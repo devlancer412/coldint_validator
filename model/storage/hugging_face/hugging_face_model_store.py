@@ -51,12 +51,12 @@ class HuggingFaceModelStore(RemoteModelStore):
         # TODO consider skipping the redownload if a hash is already provided.
         # To get the hash we need to redownload it at a local tmp directory after which it can be deleted.
         with tempfile.TemporaryDirectory() as temp_dir:
-            model_with_hash = await self.download_model(model_id_with_commit, temp_dir)
+            model_with_hash = await self.download_model(model_id_with_commit, temp_dir, token)
             # Return a ModelId with both the correct commit and hash.
             return model_with_hash.id
 
     async def download_model(
-        self, model_id: ModelId, local_path: str, model_size_limit: int = sys.maxsize
+        self, model_id: ModelId, local_path: str, token: str, model_size_limit: int = sys.maxsize
     ) -> Model:
         """Retrieves a trained model from Hugging Face."""
         if not model_id.commit:
@@ -67,7 +67,7 @@ class HuggingFaceModelStore(RemoteModelStore):
         # Check ModelInfo for the size of model.safetensors file before downloading.
         api = HfApi()
         model_info = api.model_info(
-            repo_id=repo_id, revision=model_id.commit, timeout=10, files_metadata=True
+            repo_id=repo_id, revision=model_id.commit, timeout=10, files_metadata=True, token = token
         )
         size = sum(repo_file.size for repo_file in model_info.siblings)
         if size > model_size_limit:

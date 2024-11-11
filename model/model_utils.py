@@ -30,7 +30,7 @@ from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModel
 from model.storage.model_metadata_store import ModelMetadataStore
 from model.storage.remote_model_store import RemoteModelStore
 import bittensor as bt
-from transformers import PreTrainedModel, AutoModelForCausalLM
+from transformers import PreTrainedModel, AutoModelForCausalLM, PreTrainedTokenizerFast
 from safetensors.torch import load_model
 from utilities import utils
 from transformers import (
@@ -167,12 +167,18 @@ def save(model: PreTrainedModel, model_dir: str):
     if not os.path.exists(model_dir):
         os.makedirs(model_dir, exist_ok=True)
 
+    model.save_pretrained(model_dir, safe_serialization=True)
+
+def save_tokenizer(tokenizer: PreTrainedTokenizerFast, model_dir: str):
+    """Saves a model to the provided directory"""
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir, exist_ok=True)
+
     # Save the model state to the specified path.
-    model.save_pretrained(
+    tokenizer.save_pretrained(
         save_directory=model_dir,
         safe_serialization=True,
     )
-
 
 async def get_repo(
     uid: int,
