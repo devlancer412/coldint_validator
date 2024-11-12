@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
-from huggingface_hub import update_repo_visibility
+from huggingface_hub import update_repo_settings
 import sys
 from dotenv import load_dotenv
 load_dotenv()  # take environment variables from .env.
@@ -16,7 +16,7 @@ args = parser.parse_args()
 public = args.visibility == "public"
 
 try:
-    update_repo_visibility(args.repo_id, private=not public)
+    update_repo_settings(repo_id = args.repo_id, private=not public)
 except Exception as e:
     print(f"Failed to update repo visibility {e}")
     print("(You might have to use 'huggingface-cli login'")

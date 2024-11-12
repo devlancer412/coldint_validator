@@ -10,7 +10,6 @@ import bittensor as bt
 from model.storage.remote_model_store import RemoteModelStore
 import constants
 
-
 class HuggingFaceModelStore(RemoteModelStore):
     """Hugging Face based implementation for storing and retrieving a model."""
 
@@ -37,7 +36,7 @@ class HuggingFaceModelStore(RemoteModelStore):
             repo_id=model.id.namespace + "/" + model.id.name,
             token=token,
             safe_serialization=True,
-            private=private
+            private=private,
         )
 
         model_id_with_commit = ModelId(
