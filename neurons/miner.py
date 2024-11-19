@@ -29,8 +29,10 @@ import constants
 import dataset
 from model import model_utils
 import bittensor as bt
-from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
+from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer, Adafactor
 import datetime as dt
+import gc
+from lion_pytorch import Lion
 
 
 from dotenv import load_dotenv
@@ -133,22 +135,12 @@ async def load_starting_model(
     """Loads the model to train based on the provided config."""
     
     try:
-        model = LlamaForCausalLM.from_pretrained(path)
+        model = LlamaForCausalLM.from_pretrained(path, torch_dtype = torch.float32)
         return model
     except:
-        modelConfig = LlamaConfig(
-            vocab_size=tokenizer.vocab_size, 
-            intermediate_size=14208, 
-            num_hidden_layers=20,
-            num_key_value_heads=8,
-            max_position_embeddings=4096,
-            rms_norm_eps=1e-05,
-            use_cache=False,
-            bos_token_id=100257,
-            eos_token_id=100257,
-            rope_theta=500000,
-            torch_dtype="bfloat16"
-        )
+        modelConfig = LlamaConfig.from_pretrained("luaqi/sn29_back_v16")
+
+        modelConfig.torch_dtype = torch.float32
         
         model = LlamaForCausalLM(modelConfig)
         return model
@@ -209,7 +201,13 @@ async def main(config: bt.config):
     # model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
     # Build optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wdecay)
+    optimizer = Adafactor(
+        model.parameters(), 
+        # lr=config.lr, 
+        warmup_init=True,
+        scale_parameter=True, 
+        relative_step=True
+    )
     wandb_run = None
 
     # If using wandb, start a new run.
@@ -274,7 +272,7 @@ async def main(config: bt.config):
             for i, batch in enumerate(loader):
                 print(f"round: {i}")
                 # Move the input batch to the device
-                inputs = batch.to(model.device, non_blocking=True)  # non_blocking=True may improve performance with pinned memory
+                inputs = batch.to(model.device, non_blocking=False)  # non_blocking=True may improve performance with pinned memory
 
                 # dummy_tensor = torch.zeros_like(inputs)
 
@@ -290,12 +288,13 @@ async def main(config: bt.config):
                 loss_detached = loss.detach().cpu().item()
                 # print(f"round: {i}.1 - {torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)}")
 
-                # del inputs, outputs, loss #, dummy_tensor
-                # gc.collect()
-                # torch.cuda.empty_cache()
                 # Memory usage before scaler.step()
                 if (i + 1) % accumulation_steps == 0:
                     n_acc_steps += 1
+                    
+                    del inputs, outputs, loss
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
                     scaler.step(optimizer)
                     scaler.update()
