@@ -31,8 +31,6 @@ from model import model_utils
 import bittensor as bt
 from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer, Adafactor
 import datetime as dt
-import gc
-from lion_pytorch import Lion
 
 
 from dotenv import load_dotenv
@@ -97,7 +95,7 @@ def get_config():
         "--bs", type=int, default=constants.batch_size, help="Batch size"
     )
     parser.add_argument(
-        "--sl", type=int, default=1024, help="(Max) sequence length"
+        "--sl", type=int, default=2048, help="(Max) sequence length"
     )
     parser.add_argument(
         "--accumulation_steps",
@@ -130,7 +128,6 @@ def get_config():
 
 async def load_starting_model(
     path: str,
-    tokenizer: AutoTokenizer
 ) -> LlamaForCausalLM:
     """Loads the model to train based on the provided config."""
     
@@ -189,7 +186,7 @@ async def main(config: bt.config):
     # Init model.
     # metadata_store = ChainModelMetadataStore(subtensor, None, config.netuid)
     tokenizer: AutoTokenizer = await load_starting_tokenizer(tokenizer_dir)
-    model: LlamaForCausalLM = await load_starting_model(model_dir, tokenizer)
+    model: LlamaForCausalLM = await load_starting_model(model_dir)
     if model is None or tokenizer is None:
         return False
     model = model.train()
@@ -246,7 +243,8 @@ async def main(config: bt.config):
     n_acc_steps = 0
     accumulation_steps = config.accumulation_steps
 
-    scaler = torch.amp.GradScaler("cuda")
+    # scaler = torch.amp.GradScaler("cuda")
+    model.gradient_checkpointing_enable()
 
     try:
         while epoch_step < config.num_epochs or config.num_epochs == -1:
@@ -267,40 +265,33 @@ async def main(config: bt.config):
 
             # Enumerate over the data loader
             n_batches = 0
-            optimizer.zero_grad(set_to_none=True)  # Initialize gradients to zero
+            optimizer.zero_grad()  # Initialize gradients to zero
             
             for i, batch in enumerate(loader):
-                print(f"round: {i}")
-                # Move the input batch to the device
-                inputs = batch.to(model.device, non_blocking=False)  # non_blocking=True may improve performance with pinned memory
+                # print(f"round: {i}")
+                inputs = batch.to(model.device)
 
-                # dummy_tensor = torch.zeros_like(inputs)
+                # with torch.amp.autocast("cuda"): 
+                outputs = model(inputs, labels=inputs)
+                loss = outputs.loss / accumulation_steps
 
-                with torch.amp.autocast("cuda"): 
-                    # Forward pass: compute the model output and loss
-                    outputs = model(inputs, labels=inputs)
-                    loss = outputs.loss / accumulation_steps
+                # scaler.scale(loss).backward()
+                loss.backward()
 
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
+                loss_detached = loss.detach().item()
 
-                # Record the detached loss for logging
-                loss_detached = loss.detach().cpu().item()
-                # print(f"round: {i}.1 - {torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)}")
-
-                # Memory usage before scaler.step()
+                # del inputs, outputs, loss
+                # torch.cuda.empty_cache()
+            
                 if (i + 1) % accumulation_steps == 0:
                     n_acc_steps += 1
-                    
-                    del inputs, outputs, loss
-                    torch.cuda.empty_cache()
-                    gc.collect()
 
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
+                    # scaler.step(optimizer)
+                    # scaler.update()
+                    optimizer.step()  # Perform a single optimization step
+                    optimizer.zero_grad()
                     
-                    print(f"Step: {n_acc_steps} loss: {loss_detached}")
+                    # print(f"Step: {n_acc_steps} loss: {loss_detached}")
                     if use_wandb:
                         wandb_run.log(
                             {"loss": loss_detached, "n_batches": n_batches},
@@ -311,7 +302,7 @@ async def main(config: bt.config):
                 global_step += 1
                 epoch_loss += loss_detached
                 
-                del loss_detached
+                # del loss_detached
                 torch.cuda.empty_cache()
 
             # Calculate the average loss for the epoch
@@ -324,14 +315,13 @@ async def main(config: bt.config):
             epoch_step += 1
 
             if (epoch_step % config.save_interval) == 0:
-                bt.logging.success(f"Saving model to path: {model_dir}.")
                 model_utils.save(model, model_dir)
-                model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
-                model_size_mb = os.path.getsize(model_dir) / (1024 * 1024)
-                wandb_run.log({
-                    "model_size_mb": model_size_mb
-                })
+                # del model
+                # torch.cuda.empty_cache()
+                # model = await load_starting_model(model_dir)
+                # model.to(config.device)
+                # model.gradient_checkpointing_enable()
 
         bt.logging.success(f"Finished training, saving model to {model_dir}")
         model_utils.save(model, model_dir)
