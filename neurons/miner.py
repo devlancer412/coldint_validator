@@ -21,28 +21,17 @@
 # (Parameters depend heavily on the state of the model you're starting from)
 
 import asyncio
-import math
 import os
-import sys
 import wandb
 import torch
-import random
 import argparse
 import constants
 import dataset
 from model import model_utils
-from model.storage.chain.chain_model_metadata_store import ChainModelMetadataStore
-from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore
-from model.storage.model_metadata_store import ModelMetadataStore
-from model.storage.remote_model_store import RemoteModelStore
 import bittensor as bt
-from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer
-import gc
-from utilities import utils
+from transformers import LlamaConfig, LlamaForCausalLM, AutoTokenizer, Adafactor
 import datetime as dt
 
-import torch.nn.functional as F
-from torch.cuda.amp import autocast
 
 from dotenv import load_dotenv
 
@@ -54,22 +43,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 scaler = torch.amp.GradScaler("cuda")
 
-import subprocess
-
-def check_free_memory():
-    try:
-        # Run nvidia-smi command and decode the output
-        result = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=memory.free', '--format=csv,nounits,noheader'], 
-            encoding='utf-8'
-        )
-        # Extract the free memory from the output (in MB)
-        free_memory = int(result.strip().split('\n')[0])
-        print(free_memory)
-        return free_memory
-    except Exception as e:
-        print(f"Error fetching free memory: {e}")
-        return None
 
 # === Config ===
 def get_config():
@@ -122,7 +95,7 @@ def get_config():
         "--bs", type=int, default=constants.batch_size, help="Batch size"
     )
     parser.add_argument(
-        "--sl", type=int, default=1024, help="(Max) sequence length"
+        "--sl", type=int, default=2048, help="(Max) sequence length"
     )
     parser.add_argument(
         "--accumulation_steps",
@@ -154,15 +127,19 @@ def get_config():
     return config
 
 async def load_starting_model(
-    path: str
+    path: str,
 ) -> LlamaForCausalLM:
     """Loads the model to train based on the provided config."""
     
     try:
-        model = LlamaForCausalLM.from_pretrained(path)
+        model = LlamaForCausalLM.from_pretrained(path, torch_dtype = torch.float32)
         return model
     except:
-        model = LlamaForCausalLM.from_pretrained("luaqi/sn29_back_v16")
+        modelConfig = LlamaConfig.from_pretrained("luaqi/sn29_back_v16")
+
+        modelConfig.torch_dtype = torch.float32
+        
+        model = LlamaForCausalLM(modelConfig)
         return model
 
 async def load_starting_tokenizer(
@@ -171,10 +148,11 @@ async def load_starting_tokenizer(
     """Loads the model to train based on the provided config."""
     
     try:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = AutoTokenizer.from_pretrained(path)
         return tokenizer
     except:
-        tokenizer = AutoTokenizer.from_pretrained("luaqi/sn29_v33")
+        tokenizer = AutoTokenizer.from_pretrained("Xenova/gpt-4")
+        tokenizer.save_pretrained(path)
         return tokenizer
 
 async def main(config: bt.config):
@@ -207,8 +185,8 @@ async def main(config: bt.config):
 
     # Init model.
     # metadata_store = ChainModelMetadataStore(subtensor, None, config.netuid)
-    model: LlamaForCausalLM = await load_starting_model(model_dir)
     tokenizer: AutoTokenizer = await load_starting_tokenizer(tokenizer_dir)
+    model: LlamaForCausalLM = await load_starting_model(model_dir)
     if model is None or tokenizer is None:
         return False
     model = model.train()
@@ -220,7 +198,13 @@ async def main(config: bt.config):
     # model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
     # Build optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wdecay)
+    optimizer = Adafactor(
+        model.parameters(), 
+        # lr=config.lr, 
+        warmup_init=True,
+        scale_parameter=True, 
+        relative_step=True
+    )
     wandb_run = None
 
     # If using wandb, start a new run.
@@ -259,7 +243,8 @@ async def main(config: bt.config):
     n_acc_steps = 0
     accumulation_steps = config.accumulation_steps
 
-    scaler = torch.amp.GradScaler("cuda")
+    # scaler = torch.amp.GradScaler("cuda")
+    model.gradient_checkpointing_enable()
 
     try:
         while epoch_step < config.num_epochs or config.num_epochs == -1:
@@ -280,55 +265,44 @@ async def main(config: bt.config):
 
             # Enumerate over the data loader
             n_batches = 0
-            optimizer.zero_grad(set_to_none=True)  # Initialize gradients to zero
+            optimizer.zero_grad()  # Initialize gradients to zero
             
             for i, batch in enumerate(loader):
-                print(f"round: {i}")
-                # Move the input batch to the device
-                inputs = batch.to(model.device, non_blocking=True)  # non_blocking=True may improve performance with pinned memory
+                # print(f"round: {i}")
+                inputs = batch.to(model.device)
 
-                # dummy_tensor = torch.zeros_like(inputs)
+                # with torch.amp.autocast("cuda"): 
+                outputs = model(inputs, labels=inputs)
+                loss = outputs.loss / accumulation_steps
 
-                with torch.amp.autocast("cuda"): 
-                    # Forward pass: compute the model output and loss
-                    outputs = model(inputs, labels=inputs)
-                    loss = outputs.loss / accumulation_steps
+                # scaler.scale(loss).backward()
+                loss.backward()
 
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
+                loss_detached = loss.detach().item()
 
-                # Record the detached loss for logging
-                loss_detached = loss.detach().cpu().item()
-                # print(f"round: {i}.1 - {torch.cuda.memory_reserved(0) - torch.cuda.memory_allocated(0)}")
-
-                check_free_memory()
-                # del inputs, outputs, loss #, dummy_tensor
-                # gc.collect()
+                # del inputs, outputs, loss
                 # torch.cuda.empty_cache()
-                check_free_memory()
-                # Memory usage before scaler.step()
+            
                 if (i + 1) % accumulation_steps == 0:
                     n_acc_steps += 1
 
-
-                    check_free_memory()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
+                    # scaler.step(optimizer)
+                    # scaler.update()
+                    optimizer.step()  # Perform a single optimization step
+                    optimizer.zero_grad()
                     
-                    print(f"Step: {n_acc_steps} loss: {loss_detached}")
+                    # print(f"Step: {n_acc_steps} loss: {loss_detached}")
                     if use_wandb:
                         wandb_run.log(
                             {"loss": loss_detached, "n_batches": n_batches},
                             step=n_acc_steps,
                         )
 
-                check_free_memory()
                 n_batches += 1
                 global_step += 1
                 epoch_loss += loss_detached
                 
-                del loss_detached
+                # del loss_detached
                 torch.cuda.empty_cache()
 
             # Calculate the average loss for the epoch
@@ -341,18 +315,17 @@ async def main(config: bt.config):
             epoch_step += 1
 
             if (epoch_step % config.save_interval) == 0:
-                bt.logging.success(f"Saving model to path: {model_dir}.")
                 model_utils.save(model, model_dir)
-                # model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
-                model_size_mb = os.path.getsize(model_dir) / (1024 * 1024)
-                wandb_run.log({
-                    "model_size_mb": model_size_mb
-                })
+                # del model
+                # torch.cuda.empty_cache()
+                # model = await load_starting_model(model_dir)
+                # model.to(config.device)
+                # model.gradient_checkpointing_enable()
 
         bt.logging.success(f"Finished training, saving model to {model_dir}")
         model_utils.save(model, model_dir)
-        # model_utils.save_tokenizer(tokenizer, tokenizer_dir)
+        model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
     finally:
         # Important step.
