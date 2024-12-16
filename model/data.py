@@ -12,6 +12,17 @@ GIT_COMMIT_LENGTH = 40
 # The length, in bytes, of a base64 encoded sha256 hash.
 SHA256_BASE_64_LENGTH = 44
 
+class ModelIssue(Exception):
+    '''
+    Exception class to signal issues with models preventing evaluation.
+    '''
+    pass
+
+class ModelLockedException(Exception):
+    '''
+    Exception class to signal a model is locked.
+    '''
+    pass
 
 class ModelId(BaseModel):
     """Uniquely identifies a trained model"""
@@ -62,8 +73,13 @@ class ModelId(BaseModel):
             raise Exception(f'expecting {len(keys)} elements, found {len(tokens)}, in compressed string {cs}')
         return cls(**dict(zip(keys,tokens)))
 
-    def format_label(self):
-        return f"{self.namespace}/{self.name}"
+    def format_label(self, full=False):
+        c = ''
+        if self.commit is not None:
+            c = "|" + self.commit
+            if not full:
+                c = c[:5]
+        return f"{self.namespace}/{self.name}{c}"
 
     @classmethod
     def dummy(cls, identifier: str) -> Type["ModelId"]:

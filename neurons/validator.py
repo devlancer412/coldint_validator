@@ -56,8 +56,10 @@ import wandb
 import constants
 import dataset
 import validation
+from evalstate import EvalState
+
 from model import model_utils, competitions
-from model.data import ModelId, ModelMetadata
+from model.data import ModelId, ModelMetadata, ModelIssue
 from model.model_updater import ModelUpdater
 from model.storage.disk.disk_model_store import DiskModelStore
 from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore
@@ -89,12 +91,6 @@ class Container:
     '''Empty container object'''
     pass
 
-class ModelIssue(Exception):
-    '''
-    Exception class to signal issues with models preventing evaluation.
-    '''
-    pass
-
 class Validator:
     STATE_FILENAME = "validator_state.json"
     BENCHMARK_FILENAME = "benchmark.json"
@@ -106,13 +102,23 @@ class Validator:
         # Updated by model updater thread, used by evaluation thread
         self.hall_of_fame = {}
         self.competitions = {}
-        self.defaults = {}
+
+        # Configuration parameters which can be overwritten using the 'defaults' key in competitions.json
+        self.defaults = constants.defaults
 
         # Last known hotkey metadata
         self.hk_metadata = {}
+        self.discarded_commitments = set()
+
+        # Timestamp when we last retried models with incentive we've already dropped
+        self.uid_last_retried_ts = dict()
 
         # Competition state, only used by evaluation thread
         self.cstate = {}
+
+        # eval_state: sample and loss cache
+        self.eval_state = EvalState()
+        self.eval_state.load_state(self.state_path())
 
         state = {}
         state_fn = os.path.join(self.state_path(), Validator.STATE_FILENAME)
@@ -126,13 +132,15 @@ class Validator:
         self.force_eval_until_uid_last = None
         self.last_weights_set = time.time()
         with self.state_lock:
-            if 'version' in state and state['version']//10 == constants.__spec_version__//10:
+            if 'version' in state and state['version']//100 == constants.__spec_version__//100:
                 # major.minor of version has not changed
                 self.hall_of_fame = state.pop("hall_of_fame", {})
                 self.competitions = state.pop("competitions", {})
-                self.defaults = state.pop("defaults", {})
+                self.defaults = state.pop("defaults", constants.defaults)
                 self.hk_metadata  = state.pop("hk_metadata", {})
                 self.hk_metadata = {hotkey: ModelMetadata(**info) for hotkey, info in self.hk_metadata.items()}
+                self.discarded_commitments = set(state.pop("discarded_commitments", []))
+                self.uid_last_retried_ts = state.pop("uid_last_retried_ts", {})
                 self.cstate = state.pop('cstate', {})
                 for cname, cinfo in self.cstate.items():
                     cinfo['uids_pending'] = {int(uid): prio for uid, prio in cinfo.get('uids_pending', {}).items()}
@@ -142,6 +150,9 @@ class Validator:
                 self.last_weights_set = state.pop("last_weights_set", time.time())
             else:
                 bt.logging.info("State version incompatible, starting with clean state")
+
+        self.eval_state.set_params(self.defaults)
+        self.use_eval_cache = self.defaults.get('use_eval_cache', True)
 
         bt.logging.debug(str(self.cstate))
 
@@ -155,6 +166,8 @@ class Validator:
                 'defaults': self.defaults,
                 'hall_of_fame': self.hall_of_fame,
                 'hk_metadata': {hotkey: meta.dict() for hotkey, meta in self.hk_metadata.items() if meta is not None},
+                'discarded_commitments': list(self.discarded_commitments),
+                'uid_last_retried_ts': self.uid_last_retried_ts,
                 'cstate': self.cstate,
                 'force_eval_until_uid_last': self.force_eval_until_uid_last,
                 'last_weights_set': self.last_weights_set,
@@ -309,7 +322,7 @@ class Validator:
         bt.logging.error(f"Failed to get metagraph {n_retries} times, giving up")
         return None
 
-    def visit_uids(self, metagraph, metadata, uids, prio=0, retry_interval=0):
+    def visit_uids(self, metagraph, metadata, uids, prio=0, retry_interval=0, ttl=None):
         '''
         Visit a list/set of uids: download model and update competition pending pools.
         If retry_interval non-zero, force re-evaluation after this interval.
@@ -320,9 +333,15 @@ class Validator:
         if len(uids) == 0:
             return 0
 
-        now = time.time()
+        start_ts = time.time()
         n_picked = 0
         for uid in uids:
+            now = time.time()
+            time_spent = now - start_ts
+            if ttl is not None and time_spent > ttl:
+                bt.logging.info(f"visit_uids() ttl expired after visiting {n_picked} models, spent {time_spent:.01f}sec")
+                return n_picked
+
             if uid >= len(metagraph.hotkeys):
                 continue
             hotkey = metagraph.hotkeys[uid]
@@ -330,14 +349,24 @@ class Validator:
             model_prio = prio + random.random()
 
             if hotkey_metadata is None:
+                if prio == PRIO_TOP_MODEL:
+                    bt.logging.debug(f"No metadata for top model at UID {uid}, maybe removed as duplicate commitment")
                 self.hk_metadata[hotkey] = None
                 self.add_or_remove_uid_in_competition(uid, hotkey, model_prio)
                 continue
 
             updated = hotkey_metadata != self.hk_metadata.get(hotkey, None)
-            should_retry = retry_interval != 0 and now - self.uid_last_retried_ts.get(uid,0) >= retry_interval
-            if not updated and not should_retry:
-                continue
+            if not updated:
+                if retry_interval == 0:
+                    # Not retrying any of these models
+                    continue
+                last_retry_ts = self.uid_last_retried_ts.get(uid,0)
+                last_retry_dt = now - last_retry_ts
+                if last_retry_dt < retry_interval:
+                    bt.logging.debug(f"Not yet revisiting UID {uid}, last retry was {int(last_retry_dt)} sec ago")
+                    continue
+                bt.logging.info(f"Revisiting UID {uid}")
+
             self.uid_last_retried_ts[uid] = now
 
             # Sync the model, if necessary.
@@ -346,13 +375,14 @@ class Validator:
                 sync_result = asyncio.run(
                     self.model_updater.sync_model(hotkey, hotkey_metadata)
                 )
-                bt.logging.trace(f"Sync result: {sync_result}")
 
                 if sync_result in self.model_updater.RETRY_RESULTS:
                     # By not setting self.hk_metadata[hotkey], we will retry later
+                    bt.logging.debug(f"Sync result {sync_result} for UID {uid}, retrying later")
                     pass
                 else:
                     # Update hk_metadata, so we don't retry next loop
+                    bt.logging.debug(f"Sync result {sync_result} for UID {uid}, updating hotkey metadata")
                     self.hk_metadata[hotkey] = hotkey_metadata
 
                 if sync_result == self.model_updater.SYNC_RESULT_SUCCESS:
@@ -365,6 +395,64 @@ class Validator:
                 )
 
         return n_picked
+
+    def retrieve_metadata(self, new_metagraph, top_miner_uids=None):
+        new_metadata = {}
+        commits_seen = {}
+        uid_block = {}
+        for miner_uid, hotkey in enumerate(new_metagraph.hotkeys):
+            try:
+                mdl_metadata = btlite.get_metadata(
+                    subtensor=self.subtensor,
+                    netuid=self.config.netuid,
+                    hotkey=hotkey,
+                    reconnect=True,
+                )
+                if mdl_metadata is not None:
+                    # If commitment exists multiple times, only keep oldest one
+                    mdl_metadata = ModelMetadata.parse_chain_data(mdl_metadata)
+                    lbl = mdl_metadata.id.format_label(full=True)
+                    discard_lbl = f"{hotkey}/{lbl}"
+                    if lbl in commits_seen:
+                        seen = commits_seen[lbl]
+                        if seen['block'] < mdl_metadata.block:
+                            bt.logging.info(f"UID {miner_uid} commit {lbl} @ {mdl_metadata.block} later than UID {seen['uid']} @ {seen['block']}, discarding UID {miner_uid}")
+                            mdl_metadata = None
+                        elif seen['block'] > mdl_metadata.block:
+                            bt.logging.info(f"UID {miner_uid} commit {lbl} @ {mdl_metadata.block} earlier than UID {seen['uid']} @ {seen['block']}, discarding UID {seen['uid']}")
+                            del uid_block[seen['uid']]
+                            del new_metadata[seen['hotkey']]
+                        else:
+                            bt.logging.warning(f"UID {miner_uid} commit  {lbl} @ {mdl_metadata.block} in same block as UID {seen['uid']}; keeping both")
+                    elif discard_lbl in self.discarded_commitments and self.defaults['discard_winrate'] > 0:
+                        # discard_winrate = 0 disables this feature
+                        if top_miner_uids is not None and miner_uid in top_miner_uids:
+                            bt.logging.debug(f"UID {miner_uid} marked as non-competitive, but also a top miner. Dropping from discarded list")
+                            self.discarded_commitments.remove(discard_lbl)
+                        else:
+                            bt.logging.debug(f"UID {miner_uid} commit {lbl} @ {mdl_metadata.block} discarded as non-competitive")
+                            mdl_metadata = None
+                    else:
+                        bt.logging.debug(f"UID {miner_uid} commit {lbl} @ {mdl_metadata.block}")
+
+                if mdl_metadata is not None:
+                    new_metadata[hotkey] = mdl_metadata
+                    uid_block[miner_uid] = mdl_metadata.block
+                    commits_seen[lbl] = {
+                        'uid': miner_uid,
+                        'block': mdl_metadata.block,
+                        'hotkey': hotkey,
+                    }
+
+            except Exception as e:
+                bt.logging.error(
+                    f"Failed to fetch metadata for UID {miner_uid}: {type(e).__name__} {e} \n {traceback.format_exc()}"
+                )
+                if hotkey in self.hk_metadata:
+                    bt.logging.debug(f"Using old metadata after update failure for {hotkey}")
+                    new_metadata[hotkey] = self.hk_metadata[hotkey]
+
+        return new_metadata, uid_block
 
     def update_chain(self):
         now = time.time()
@@ -390,36 +478,29 @@ class Validator:
         self.last_chain_update = now
         bt.logging.info(f"Synced metagraph with {len(self.metagraph.neurons)} neurons, last_chain_update = {now}")
 
-        # Fetch miner metadata
-        new_metadata = {}
+        # Fetch top miners according to other validators
+        top_miner_uids = set(utils.list_top_miners(new_metagraph))
+
+        # Retrieve deduplicated commitment metadata
+        new_metadata, uid_block = self.retrieve_metadata(new_metagraph, top_miner_uids=top_miner_uids)
+
+        # Determine which commitments changed
         for miner_uid, hotkey in enumerate(new_metagraph.hotkeys):
-            try:
-                mdl_metadata = btlite.get_metadata(
-                    subtensor=self.subtensor,
-                    netuid=self.config.netuid,
-                    hotkey=hotkey,
-                    reconnect=True,
-                )
-                if mdl_metadata is not None:
-                    mdl_metadata = ModelMetadata.parse_chain_data(mdl_metadata)
-                    new_metadata[hotkey] = mdl_metadata
-                updated = new_metadata.get(hotkey, None) != self.hk_metadata.get(hotkey, None)
-                if ( old_metagraph
-                        and miner_uid in self.uid_last_retried_ts
-                        and len(old_metagraph.hotkeys)>miner_uid
-                        and old_metagraph.hotkeys[miner_uid] != hotkey ):
-                    bt.logging.info(f'Hotkey of UID {miner_uid} changed from {old_metagraph.hotkeys[miner_uid]} to {hotkey}; resetting uid_last_retried_ts')
-                    del self.uid_last_retried_ts[miner_uid]
-                bt.logging.debug(f"Metadata UID {miner_uid}/{hotkey}, updated={updated}, commitment: {mdl_metadata.id.format_label() if mdl_metadata else '---'}")
-            except Exception as e:
-                bt.logging.error(
-                    f"Failed to fetch metadata for UID {miner_uid}: {type(e).__name__} {e} \n {traceback.format_exc()}"
-                )
-                if hotkey in self.hk_metadata:
-                    bt.logging.debug(f"Using old metadata after update failure for {hotkey}")
-                    new_metadata[hotkey] = self.hk_metadata[hotkey]
+            new_meta = new_metadata.get(hotkey, None)
+            updated = new_meta != self.hk_metadata.get(hotkey, None)
+            if ( old_metagraph
+                    and miner_uid in self.uid_last_retried_ts
+                    and len(old_metagraph.hotkeys)>miner_uid
+                    and old_metagraph.hotkeys[miner_uid] != hotkey ):
+                bt.logging.info(f'Hotkey of UID {miner_uid} changed from {old_metagraph.hotkeys[miner_uid]} to {hotkey}; resetting uid_last_retried_ts')
+                del self.uid_last_retried_ts[miner_uid]
+            if updated:
+                bt.logging.debug(f"Metadata update for UID {miner_uid}/{hotkey}: {new_meta.id.format_label() if new_meta else '---'}")
 
         bt.logging.info(f"Synced metadata; {len(new_metadata)} commitments")
+
+        download_start_ts = time.time()
+        download_ttl_ts = download_start_ts + constants.TTL_DOWNLOAD_MODELS
 
         # 3-step strategy:
         # 1. Pick top miners every TOP_MODEL_RETRY_INTERVAL
@@ -435,8 +516,7 @@ class Validator:
             hotkey_metadata = new_metadata.get(hotkey, None)
             self.hk_metadata[hotkey] = hotkey_metadata
 
-        # Determine top miners according to other valis
-        top_miner_uids = set(utils.list_top_miners(new_metagraph))
+        # Visit new top miners
         new_top_uids = top_miner_uids - active_uids
         bt.logging.debug(f"Visiting top UIDs: {new_top_uids}")
         n_top_updated = self.visit_uids(
@@ -445,6 +525,7 @@ class Validator:
                 new_top_uids,
                 prio=PRIO_TOP_MODEL,
                 retry_interval=constants.TOP_MODEL_RETRY_INTERVAL,
+                ttl=download_ttl_ts-time.time(),
         )
 
         n_uids = len(new_metagraph.hotkeys)
@@ -458,6 +539,7 @@ class Validator:
                 new_metadata,
                 non_active_uids,
                 prio=PRIO_NEW_MODEL,
+                ttl=download_ttl_ts-time.time(),
         )
 
         # We need all models to be re-evaluated periodically, to make sure they
@@ -480,6 +562,10 @@ class Validator:
         else:
             revisit_uids = ( np.arange(self.force_eval_until_uid_last, constants.SUBNET_N_UIDS).tolist() +
                             np.arange(0, force_eval_until_uid).tolist() )
+
+        # In case force_eval_until_uid_last was out of sync, retry most recent part
+        revisit_uids = revisit_uids[-constants.MODEL_RETRY_MAX_N_PER_LOOP:]
+
         bt.logging.debug(f"Revisiting UIDs: {revisit_uids}")
         n_revisit_models = self.visit_uids(
                 new_metagraph,
@@ -487,6 +573,7 @@ class Validator:
                 revisit_uids,
                 prio=PRIO_REVISIT,
                 retry_interval=constants.GEN_MODEL_RETRY_INTERVAL//2,
+                ttl=download_ttl_ts-time.time(),
         )
         self.force_eval_until_uid_last = force_eval_until_uid
 
@@ -512,7 +599,11 @@ class Validator:
         if comps is not None:
             with self.state_lock:
                 self.competitions = comps
-                self.defaults = defaults
+                cdefaults = constants.defaults.copy()
+                cdefaults.update(defaults)
+                self.defaults = cdefaults
+                self.eval_state.set_params(self.defaults)
+                self.use_eval_cache = self.defaults.get('use_eval_cache', True)
                 self.model_updater.set_competitions(self.competitions)
 
         # Hall of fame
@@ -534,8 +625,6 @@ class Validator:
         Deletes models that are not needed, subject to diskspace requirements.
         """
 
-        # Timestamp when we last retried models with incentive we've already dropped
-        self.uid_last_retried_ts = dict()
         # Timestamp when we last fetched hall of fame
         self.last_cfg_fetch = None
         # Timestamp when we last updated chain
@@ -565,6 +654,9 @@ class Validator:
 
     def clean_models(self):
         """Cleans up models that are no longer referenced."""
+
+        if self.config.no_clean:
+            return
 
         base_dir = pathlib.Path(self.local_store.base_dir)
         if not base_dir.exists():
@@ -747,26 +839,42 @@ class Validator:
         # Collect uid evaluation data here
         self.step_uid_log = dict()
 
-        # Currently, all competitions use the same dataset.
-        # Fetch samples that are shared between all competitions
-        try:
-            dataloader = dataset.SubsetFineWebEdu2Loader(
-                batch_size=1,
-                num_pages=0,
-                num_rows_per_page=self.defaults.get('rows_per_page',constants.n_rows_per_page),
-                tokenizer=None,
-                pack=False
-            )
-        except requests.exceptions.RequestException as e:
-            bt.logging.warning(f"Exception instantiating dataloader: {e}. Waiting one minute before retrying.")
-            await asyncio.sleep(60)
-            return
+        # Set model index in loss matrix for each uid that should be evaluated
+        active_meta = {
+            uid: self.get_uid_metadata(uid)
+                for uid in self.get_all_active_uids()
+        }
+        uid_to_matrix_idx = {}
+        if self.use_eval_cache:
+            uid_to_matrix_idx = {
+                uid: self.eval_state.get_model_idx(meta.path)
+                    if (meta is not None and meta.path is not None) else None
+                for uid, meta in active_meta.items()
+            }
+            self.eval_state.uid_to_matrix_idx = uid_to_matrix_idx
+            model_indices = [v for v in uid_to_matrix_idx.values() if v is not None]
 
-        samples = dataloader.fetch_data_to_rows(self.defaults.get('eval_pages',constants.n_eval_pages))
-        if len(samples) == 0:
-            bt.logging.warning(f"No samples to eval. Waiting one minute before retrying.")
-            await asyncio.sleep(60)
-            return
+            # Update sampleset
+            self.eval_state.update_sampleset()
+            self.eval_state.save_state(self.state_path())
+
+            # Pick subset for current evaluation
+            dataloader = self.eval_state.pick_samples(model_indices, self.defaults['eval_samples'])
+        else:
+            bt.logging.info(f"Not using eval cache, loading {self.defaults['eval_samples']} fresh samples")
+            try:
+                dataloader = dataset.SubsetFineWebEdu2Loader(
+                    batch_size=1,
+                    num_pages=0,
+                    num_rows_per_page=self.defaults['rows_per_page'],
+                    tokenizer=None,
+                    pack=False
+                )
+            except requests.exceptions.RequestException as e:
+                bt.logging.warning(f"Exception instantiating dataloader: {e}. Waiting one minute before retrying.")
+                await asyncio.sleep(60)
+                return
+            samples = dataloader.fetch_data_to_rows(self.defaults['eval_samples'] // self.defaults['rows_per_page'])
 
         n_models_evaluated = 0
         t_per_competition = constants.TTL_RUN_STEP/len(self.competitions)
@@ -811,20 +919,34 @@ class Validator:
             cstate = self.cstate[cname]
 
             # Select at most pool_size + pend_size uids, sorted on priority number
-            pend = cstate['uids_pending']
+            pend = cstate['uids_pending'].copy()
             cur_pool = cstate['uids_pool']
             bt.logging.debug(f"Competition {cname} pool: {cur_pool}, pending: {pend}")
             pend.update({uid: PRIO_POOL for uid in cur_pool})
             pend = [(prio, uid) for uid, prio in pend.items()]
             pend.sort(reverse=True)
-            uids_pool = [uid for (prio, uid) in pend[:pool_size+pend_size]]
+            if self.use_eval_cache:
+                uids_pool = [uid for (prio, uid) in pend \
+                                if uid in self.eval_state.uid_to_matrix_idx.keys()]
+            else:
+                uids_pool = [uid for (prio, uid) in pend]
+            uids_pool = uids_pool[:pool_size+pend_size]
+
             picked = set(uids_pool) - set(cur_pool)
+            not_picked = set(cstate['uids_pending'].keys()) - picked
             if len(picked):
                 bt.logging.debug(f"Picked: {picked}")
+            if len(not_picked):
+                bt.logging.debug(f"Not picked: {not_picked}")
 
             # Update pool/pending state
-            cstate['uids_pending'] = {}
             cstate['uids_pool'] = uids_pool
+            for uid_picked in picked:
+                del cstate['uids_pending'][uid_picked]
+            for uid_not_picked in not_picked:
+                if cstate['uids_pending'][uid_not_picked] < PRIO_NEW_MODEL:
+                    bt.logging.debug(f"Skipping pending re-evaluation of UID {uid_not_picked}")
+                    del cstate['uids_pending'][uid_not_picked]
 
         if len(uids_pool) == 0:
             with self.state_lock:
@@ -860,20 +982,32 @@ class Validator:
         model_geometry_per_uid = {uid: {} for uid in uids_pool}
         uid_to_label = {uid: '' for uid in uids_pool}
         uid_to_block = {uid: 1<<31 for uid in uids_pool}
+
+        # Fetch pre-cached losses
+        loss_mat_losses = {}
+        if self.use_eval_cache:
+            for uid in uids_pool:
+                mat_idx = self.eval_state.uid_to_matrix_idx[uid]
+                if mat_idx is None:
+                    continue
+                loss_mat_losses[mat_idx] = self.eval_state.losses[mat_idx, dataloader.sample_idxs]
+
         n_evaluated = 0
         for uid in uids_pool:
             if ts_expire is not None and time.time() > ts_expire:
                 bt.logging.warning("Model eval loop taking too long, stopping loop")
                 break
 
-            bt.logging.trace(f"Computing model losses for UID {uid}.")
             metadata = self.get_uid_metadata(uid)
-
-            losses_per_uid[uid] = [math.inf]*n_batches
-            losses_pt_per_uid[uid] = losses_per_uid[uid].copy()
             if metadata is None:
-                bt.logging.debug(f"Unable to load metadata for UID {uid}. Setting loss to infinity.")
+                bt.logging.warning(f"UID {uid} metadata unavailable")
                 continue
+
+            content_hash = "---"
+            if metadata.model_idx is not None:
+                content_hash = self.eval_state.models[metadata.model_idx]
+            bt.logging.info(f"Computing losses for UID {uid}, model idx {metadata.model_idx}, content hash {content_hash}.")
+
             try:
                 uid_to_block[uid] = metadata.block if metadata.block is not None else 1<<31
                 uid_to_label[uid] = metadata.id.format_label()
@@ -884,10 +1018,7 @@ class Validator:
                 # Get model tokenizer if no competition-wide tokenizer is set
                 mdl_batches = batches
                 max_token_id = batches_max_token_id
-                model_path = disk_utils.get_local_model_snapshot_dir(
-                        self.local_store.base_dir,
-                        metadata.hotkey,
-                        metadata.id) if metadata.path is None else metadata.path
+                model_path = metadata.path
                 tokenizer_json = os.path.join(model_path,'tokenizer.json')
                 if not os.path.exists(tokenizer_json):
                     # Assume tokenizer.json indicates an embedded tokenizer is available.
@@ -921,6 +1052,11 @@ class Validator:
                     # We should never arrive here
                     raise Exception("No tokenizer available (no default and not supplied in model)")
 
+                loss_matrix_idx = None
+                if self.use_eval_cache:
+                    loss_matrix_idx = self.eval_state.uid_to_matrix_idx[uid]
+                    if loss_matrix_idx is None:
+                        raise Exception(f"eval_state inconsistency: loss_matrix_idx for UID {uid} unknown")
 
                 eval_results = utils.run_in_subprocess(
                     functools.partial(
@@ -931,6 +1067,7 @@ class Validator:
                         batches=mdl_batches,
                         max_token_id=max_token_id,
                         device=self.config.device,
+                        loss_mat_losses=loss_mat_losses.get(loss_matrix_idx, None)
                     ),
                     ttl=constants.TTL_MODEL_EVAL,
                     mode="spawn",
@@ -947,13 +1084,23 @@ class Validator:
                 model_geometry_per_uid[uid] = eval_results['model_geometry']
                 bt.logging.debug(f"Losses for UID {uid}, per token: {naninf_mean(losses_pt):.03f} +- {naninf_std(losses_pt):.03f}, sum {naninf_mean(losses):.01f} +- {naninf_std(losses):.01f}, avg sample len: {eval_results['avg_sample_length']:.01f}")
 
+                # Update loss cache
+                if self.use_eval_cache:
+                    if eval_results.get('reset_loss_cache', False):
+                        self.eval_state.reset_loss_values(loss_matrix_idx)
+                        n_updated = 1
+                    else:
+                        n_updated = self.eval_state.update_loss_values(dataloader, loss_matrix_idx, np.array(losses))
+                    if n_updated > 0:
+                        self.eval_state.save_state(self.state_path())
+
             except ModelIssue as e:
                 bt.logging.info(
                     f'Model issue for UID {uid}, disqualifying: {e}'
                 )
             except Exception as e:
                 bt.logging.error(
-                    f"Error in eval loop: {e}. Setting losses for UID {uid} to infinity.\n{traceback.format_exc()}"
+                    f"Error in eval loop: {e}. Setting losses for UID {uid} to NaN.\n{traceback.format_exc()}"
                 )
                 if transformers.__version__ != TRANSFORMERS_VERSION_OPTIMAL:
                     bt.logging.error(f'Please run with transformers version {TRANSFORMERS_VERSION_OPTIMAL} (currently running {transformers.__version__}) before reporting issues.')
@@ -989,7 +1136,7 @@ class Validator:
         win_rate_indices = win_rate.argsort()
         sorted_uids = [uids_pool[i] for i in win_rate_indices]
         new_uids_pool = sorted_uids[-pool_size:]
-        bt.logging.info(f'selected {pool_size} winning models: {new_uids_pool}')
+        bt.logging.info(f'selected {pool_size} winning models for competition {cname}: {new_uids_pool}')
 
         dropped_uids = sorted_uids[:-pool_size]
         if len(dropped_uids):
@@ -1010,6 +1157,22 @@ class Validator:
             if state['gb_space_left'] == 0:
                 bt.logging.debug(f"deleting model for UID {uid}; {state['usage_str']}")
                 self.local_store.delete_model(hk, metadata.id)
+
+            # Mark evaluated models with low win-rate as discarded
+            have_losses = (
+                    uid in losses_per_uid
+                    and losses_per_uid[uid] is not None
+                    and np.sum(~np.isnan(losses_per_uid[uid])) > 0
+                )
+            if (uid in win_info['win_rate'] and
+                    win_info['win_rate'][uid] < self.defaults['discard_winrate'] and
+                    win_info['win_abs_rate'][uid] < self.defaults['discard_winrate'] and
+                    have_losses # Here, only drop models if succesfully evaluated
+                ):
+                bt.logging.info(f"Marking model of UID {uid} as discarded due to low current and absolute win-rate")
+                lbl = metadata.id.format_label(full=True)
+                discard_lbl = f"{hk}/{lbl}"
+                self.discarded_commitments.add(discard_lbl)
 
         # Update state: weights and which uids to keep for next run
         with self.state_lock:
@@ -1034,7 +1197,7 @@ class Validator:
                 "block": uid_to_block.get(uid, 1<<31),
                 "losses": losses_per_uid[uid],
                 "n_samples": naninf_count(losses_per_uid[uid]),
-                "n_inf": np.sum(np.isinf(losses_per_uid[uid])),
+                "n_inf": np.sum(np.isinf(losses_per_uid[uid])) if losses_per_uid[uid] is not None else 0,
                 "avg_sample_len": avg_sample_len_per_uid[uid],
                 "loss_pt_avg": naninf_mean(losses_pt_per_uid[uid]),
                 "loss_pt_std": naninf_std(losses_pt_per_uid[uid]),
@@ -1070,12 +1233,38 @@ class Validator:
             # Model from chain
             hotkey = self.get_uid_hotkey(uid)
             chain_data = self.hk_metadata.get(hotkey, None)
-            if chain_data is not None:
-                metadata = Container()
-                metadata.hotkey = hotkey
-                metadata.id = chain_data.id
-                metadata.block = chain_data.block
-                metadata.path = None
+            if chain_data is None:
+                return None
+
+            metadata = Container()
+            metadata.hotkey = hotkey
+            metadata.id = chain_data.id
+            metadata.block = chain_data.block
+            metadata.path = disk_utils.get_local_model_snapshot_dir(
+                self.local_store.base_dir,
+                metadata.hotkey,
+                metadata.id
+            )
+
+        metadata.model_idx = None
+        if self.use_eval_cache:
+            metadata.model_idx = self.eval_state.get_model_idx(metadata.path)
+            first_seen = self.eval_state.get_model_first_seen(metadata.model_idx, metadata.hotkey, metadata.block)
+            if first_seen is not None and first_seen['hotkey'] != metadata.hotkey:
+                bt.logging.info(f"UID {uid}/{metadata.hotkey} serves copy of model idx {metadata.model_idx} by {first_seen['hotkey']} @ {first_seen['block']}, ignoring")
+
+                # Mark commitments so that it is not downloaded again
+                lbl = metadata.id.format_label(full=True)
+                discard_lbl = f"{metadata.hotkey}/{lbl}"
+                if discard_lbl not in self.discarded_commitments:
+                    bt.logging.info(f"UID {uid}/{metadata.hotkey} marking as discarded")
+                    self.discarded_commitments.add(discard_lbl)
+
+                return None
+            if metadata.model_idx is None:
+                bt.logging.info(f"UID {uid}/{metadata.hotkey} unable to get model index")
+                return None
+
         return metadata
 
     def inject_models(self):
@@ -1234,7 +1423,8 @@ class Validator:
         # Install signal handler for clean shutdown.
         signal.signal(signal.SIGINT, self.shutdown)
         # Give update thread some time to fetch initial state from chain.
-        await asyncio.sleep(60)
+        if self.config.device != 'random':
+            await asyncio.sleep(60)
         while True:
             try:
                 self.current_block = self.metagraph.block.item()
@@ -1253,6 +1443,7 @@ class Validator:
                 bt.logging.error(
                     f"Error in validator loop \n {e} \n {traceback.format_exc()}"
                 )
+                await asyncio.sleep(5)
 
 def check_and_compute_losses(
         local_store=None,
@@ -1261,9 +1452,16 @@ def check_and_compute_losses(
         batches=None,
         max_token_id=None,
         device=None,
+        loss_mat_losses=None,
     ):
     cinfo = competition_info
-    model_i = local_store.retrieve_model(metadata.hotkey, metadata.id, path=metadata.path)
+    try:
+        torch.set_default_device('meta')
+        model_i = local_store.retrieve_model(metadata.hotkey, metadata.id, path=metadata.path)
+        torch.set_default_device(None)
+    except Exception as e:
+        raise ModelIssue(f"Failed to load model: {e}")
+
     mdl_allowed, reason = competitions.validate_model_constraints(model_i.pt_model, cinfo)
     if not mdl_allowed:
         raise ModelIssue(f"Model violates competition {cname} constraints: {reason}")
@@ -1272,6 +1470,11 @@ def check_and_compute_losses(
     if 'Sliced' in model_type:
         # Test the exact model type name to check whether slicing is allowed by config:
         allow_sliced = model_type in cinfo['model_types']
+
+    if not allow_sliced:
+        bt.logging.info(f'Model of type {model_type} cannot be sliced, reloading on device')
+        # Not expected. Load model properly.
+        model_i = local_store.retrieve_model(metadata.hotkey, metadata.id, path=metadata.path)
 
     embed_size = None
     try:
@@ -1294,7 +1497,66 @@ def check_and_compute_losses(
         'hidden_size':getattr(model_i.pt_model.config,'hidden_size',0),
     }
 
-    losses = validation.compute_losses(model_i.pt_model,allow_sliced,batches,device)
+    if loss_mat_losses is not None:
+        # Only compute losses of samples with np.nan in loss_mat_losses
+        compute_mask = np.isnan(loss_mat_losses)
+        inf_mask = np.isinf(loss_mat_losses)
+        if np.sum(inf_mask) > len(inf_mask)/2:
+            # In case more than half of losses are inf, assume there has been an evaluation problem earlier
+            compute_mask |= inf_mask
+        n_to_compute = np.sum(compute_mask)
+        n_cached = len(loss_mat_losses) - n_to_compute
+        full_batches = batches
+        batches = [b for b,m in zip(batches, compute_mask) if m]
+
+        validate_idxs = []
+        if n_cached > n_to_compute:
+            # If using more cached than compute values, use a few samples to validate consistency
+            n_validate = min(int(n_cached * constants.SAMPLE_CHECK_FRACTION), constants.SAMPLE_CHECK_MAX_N)
+            validate_idxs = np.arange(len(full_batches))[~compute_mask][:n_validate]
+            validate_batches = [full_batches[v_i] for v_i in validate_idxs]
+            batches += validate_batches
+
+        bt.logging.info(f"{len(loss_mat_losses)} losses requested, {n_cached} cached, {n_to_compute}+{len(validate_idxs)} to compute")
+
+    if len(batches) == 0:
+        losses = []
+    elif device == 'random':
+        losses = [(rnd+0.5) * len(batch[0]) if batch is not None else math.inf for rnd, batch in zip(np.random.rand(len(batches)), batches)]
+    else:
+        losses = validation.compute_losses(model_i.pt_model,allow_sliced,batches,device)
+
+    reset_loss_cache = False
+    if loss_mat_losses is not None:
+        if len(validate_idxs):
+            validate_losses = losses[-len(validate_idxs):]
+            losses = losses[:-len(validate_idxs)]
+            n_ok = 0
+            for i, batch_idx in enumerate(validate_idxs):
+                cached_loss = loss_mat_losses[batch_idx]
+                validation_loss = validate_losses[i]
+                if np.isfinite(validation_loss) and np.isfinite(cached_loss) and cached_loss != 0:
+                    delta_pct = 100 * (validation_loss / cached_loss - 1)
+                else:
+                    delta_pct = 0
+                if abs(delta_pct) < 0.1:
+                    n_ok += 1
+                else:
+                    bt.logging.error(f"Cached loss mismatch: idx {i} cached {cached_loss}, validated {validation_loss}")
+                #bt.logging.info(f"{i:3d}: cached {cached_loss:.03f}, vali {validation_loss:.03f}, delta {delta_pct:.02f}%")
+            if n_ok == len(validate_idxs):
+                bt.logging.info(f"Check of cached losses: all {n_ok} deltas <0.1%")
+            else:
+                bt.logging.error(f"Check of cached losses: {len(validate_idxs)-n_ok}/{len(validate_idxs)} losses differ by >0.1%, please report!")
+                reset_loss_cache = True
+                loss_mat_losses = [np.nan]*len(loss_mat_losses)
+
+        # Restore complete loss vector / batches using cached data
+        l = np.array(loss_mat_losses)
+        l[compute_mask] = losses
+        losses = l
+        batches = full_batches
+
     losses_pt = [loss_sum / len(batch[0]) if batch is not None else math.inf for loss_sum, batch in zip(losses, batches)]
     sample_lengths = [len(batch[0]) for batch in batches if batch is not None]
     avg_sample_length = 0 if len(sample_lengths) == 0 else np.mean(sample_lengths)
@@ -1304,6 +1566,7 @@ def check_and_compute_losses(
         'losses_pt':losses_pt,
         'avg_sample_length':avg_sample_length,
         'model_geometry':model_geometry,
+        'reset_loss_cache': reset_loss_cache,
     }
 
 def assert_cuda():

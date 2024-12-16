@@ -21,12 +21,6 @@ def validator_config():
         help="Turn off wandb logging.",
     )
     parser.add_argument(
-        "--pages_per_eval",
-        type=int,
-        default=constants.n_eval_pages,
-        help="Number of pages used to eval each step.",
-    )
-    parser.add_argument(
         "--dont_set_weights",
         action="store_true",
         help="Validator does not set weights on the chain.",
@@ -35,6 +29,11 @@ def validator_config():
         "--offline",
         action="store_true",
         help="Does not launch a wandb run, does not set weights, does not check that your key is registered.",
+    )
+    parser.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="Do not clean models.",
     )
     parser.add_argument(
         "--model_dir",

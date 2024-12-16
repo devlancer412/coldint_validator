@@ -11,6 +11,7 @@ import copy
 import time
 import logging
 import argparse
+import subprocess
 
 args = None
 tokenizer = None
@@ -54,8 +55,6 @@ def evaluate_losses(model,samples):
         except Exception as e:
             logging.info(f'failed to evaluate, using inf. Exception: {e}')
             losses.append(np.inf)
-    logging.debug('moving model to cpu')
-    model.to('cpu')
     return losses
 
 def load_sample_file(fn):
@@ -97,6 +96,11 @@ def load_sample_file(fn):
 def load_samples():
     samples = []
     for f in args.samples:
+        if f == 'license':
+            license_bytes = subprocess.check_output('python -c license.MAXLINES=1<<30;license()'.split(' '))
+            license_text = license_bytes.decode('utf-8')
+            samples.append({'text':license_text})
+            continue
         if not os.path.exists(f):
             logging.error(f'ignoring non-existant sample file {f}')
             continue
@@ -131,7 +135,7 @@ def load_model(path, attn_implementation="flash_attention_2"):
     elif args.dtype == 'float32':
         dtype = torch.float32
     else:
-        raise ValueError("Unkown datatype {args.dtype}")
+        raise ValueError(f"Unkown datatype {args.dtype}")
 
     logging.info(f"Loading model {path}, attn={attn_implementation}, dtype {args.dtype}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -142,7 +146,7 @@ def load_model(path, attn_implementation="flash_attention_2"):
         torch_dtype=dtype
     )
     try:
-        tokenizer_obj = AutoTokenizer.from_pretrained(path)
+        tokenizer_obj = AutoTokenizer.from_pretrained(args.tokenizer or path)
         logging.info('loaded tokenizer from model path')
     except:
         tokenizer_name = "Xenova/gpt-4"
@@ -162,6 +166,8 @@ def arg_parser(argv):
             help='Evaluate not more than N samples')
     parser.add_argument('--max-sample-len', default=100000, type=int,
             help='Maximum sample length')
+    parser.add_argument('--tokenizer', default=None,
+            help='Override embedded or default tokenizer')
     parser.add_argument('--attn', default=None, choices=['sdpa','eager','flash_attention_2'],
             help='Override attention implementation when loading model (note that eager and flash_attention_2 are compatible, but the latter requires a cuda device)')
     parser.add_argument('--dtype', default='bfloat16', choices=['bfloat16','float16','float32'],
@@ -170,6 +176,8 @@ def arg_parser(argv):
             help='Increase verbosity')
     parser.add_argument('--device', default='cuda:0',
             help='Cuda device to use')
+    parser.add_argument('--skip-unsliced-eval', default=False, action='store_true',
+            help='Skip unsliced evaluation (e.g. for huge models that will not fit)')
     parser.add_argument('--start-layers', default='0',
             help='List of integers specifying layer starts for each slice (e.g. 0,4,8,12)')
     parser.add_argument('--auto-slice', metavar='N', default=None, type=int,
@@ -209,9 +217,13 @@ def main():
             attn_implementation = "flash_attention_2"
         else:
             attn_implementation = "eager"
+    if args.skip_unsliced_eval:
+        # don't actually load weights yet
+        torch.set_default_device('meta')
     t0 = time.time()
     model, tokenizer = load_model(args.model, attn_implementation=attn_implementation)
     t_loading = time.time() - t0
+    torch.set_default_device(None)
 
     if False and args.auto_slice is not None:
         n_layers = model.config.num_hidden_layers
@@ -230,12 +242,17 @@ def main():
     t_slicing = 0
     t_evaluating_sliced = 0
     with torch.no_grad():
-        t0 = time.time()
-        losses_regular = evaluate_losses(model,samples[:args.max_samples])
-        t_evaluating_regular = time.time() - t0
-        logging.debug(f'evaluated regularly in {t_evaluating_regular}s')
-
-        logging.info(f'losses regular: sum={sum(losses_regular)}, {losses_regular[:20]}...')
+        if args.skip_unsliced_eval:
+            losses_regular = 0
+            t_evaluating_regular = 0
+        else:
+            t0 = time.time()
+            losses_regular = evaluate_losses(model,samples[:args.max_samples])
+            t_evaluating_regular = time.time() - t0
+            logging.debug('moving model to cpu')
+            model.to('cpu')
+            logging.debug(f'evaluated regularly in {t_evaluating_regular}s')
+            logging.info(f'losses regular: sum={sum(losses_regular)}, {losses_regular[:20]}...')
 
         if hasattr(model,'sliced'):
             t0 = time.time()
@@ -243,7 +260,6 @@ def main():
                     n_slices=args.auto_slice,
                     start_layers=args.start_layers if args.auto_slice is None else None,
                     device=args.device,
-                    max_sample_len=args.max_sample_len,
             )
             t_slicing = time.time() - t0
             logging.info(f'sliced: {sliced}')

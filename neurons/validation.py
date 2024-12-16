@@ -30,15 +30,24 @@ import itertools
 from utilities.mathutils import *
 
 def group_samples(losses_per_uid, group_size):
-    uids = list(losses_per_uid.keys())
+    uids = []
+    for uid, losses in losses_per_uid.items():
+        if losses is None:
+            bt.logging.debug(f"group_samples(): no losses for UID {uid}")
+        else:
+            uids.append(uid)
+
     loss_mat = np.array([
         losses_per_uid[uid] for uid in uids
     ])
 
-    # Zero samples where everyone scored NaN
-    nans = np.isnan(loss_mat) | np.isinf(loss_mat)
-    all_nan = np.sum(nans, axis=0) == loss_mat.shape[0]
-    loss_mat[:, all_nan] = 0
+    # Convert NaNs to inf (NaNs don't compare correctly)
+    loss_mat[np.isnan(loss_mat)] = np.inf
+
+    # Zero samples where everyone scored inf
+    infs = np.isinf(loss_mat)
+    all_inf = np.sum(infs, axis=0) == loss_mat.shape[0]
+    loss_mat[:, all_inf] = 0
 
     # Shuffle samples to reduce effect of correlations
     n_samples = loss_mat.shape[1]
@@ -49,10 +58,18 @@ def group_samples(losses_per_uid, group_size):
 
     # Note that a single NaN in the set results in NaN for the group
     summed = loss_mat.reshape(len(uids),-1,group_size).sum(axis=2)
-    return {uid:np.ascontiguousarray(summed[i]) for i,uid in enumerate(uids)}
+
+    ret = {uid:np.ascontiguousarray(summed[i]) for i,uid in enumerate(uids)}
+
+    # Add back uids for which losses were None
+    for uid in losses_per_uid.keys():
+        if uid not in ret:
+            ret[uid] = None
+
+    return ret
 
 def compute_wins(
-    losses_per_uid: typing.Dict[int, typing.List[float]],
+    all_losses_per_uid: typing.Dict[int, typing.List[float]],
     uid_to_block: typing.Dict[int, int],
     current_block,
     advantage_initial,
@@ -75,12 +92,17 @@ def compute_wins(
                         advantage_factors
                         matrix {uid_a -> {uid_b -> info}}
     """
+    wins = {uid: 0 for uid in all_losses_per_uid.keys()}
+    abs_wins = {uid: 0 for uid in all_losses_per_uid.keys()}
+    losses_per_uid = {}
+    for uid, losses in all_losses_per_uid.items():
+        if losses is None:
+            bt.logging.debug(f'compute_wins() dropping UID {uid} because losses is None')
+            continue
+        losses_per_uid[uid] = np.array(losses)
     uids_sorted = sorted(losses_per_uid.keys(), key=lambda x: uid_to_block.get(x))
     if len(uids_sorted) == 0:
         return {}
-    wins = {uid: 0 for uid in uids_sorted}
-    abs_wins = {uid: 0 for uid in uids_sorted}
-    losses_per_uid = {uid: np.array(losses) for uid, losses in losses_per_uid.items()}
 
     # Determine advantage factors
     uid_advantage_factors = {}
@@ -99,31 +121,17 @@ def compute_wins(
     # For each sample, determine winner and award 1 point
     n_samples = len(losses_per_uid[uids_sorted[0]])
     for sample_idx in range(n_samples):
-        sample_loss = [losses_per_uid[uid][sample_idx] for uid in uids_sorted]
-
-        for i_uid_a, uid_a in enumerate(uids_sorted):
-            uid_a_loss = sample_loss[i_uid_a]
-            uid_a_loss_adv = uid_a_loss * uid_advantage_factors[uid_a]
-            won_all = True
-            for i_uid_b in range(len(uids_sorted)):
-                if i_uid_a == i_uid_b:
-                    pass
-                uid_b_loss = sample_loss[i_uid_b]
-                if i_uid_b < i_uid_a:
-                    # uid_a should win from all *older* models in absolute sense
-                    if uid_a_loss >= uid_b_loss:
-                        won_all = False
-                        break
-                elif i_uid_b > i_uid_a:
-                    # uid_a should win from all *newer* models using its advantage factor
-                    if uid_a_loss_adv > uid_b_loss:
-                        won_all = False
-                        break
-            if won_all and not np.isnan(uid_a_loss) and not np.isinf(uid_a_loss):
-                wins[uid_a] += 1
-                break
+        win_uid = None
+        win_loss_adv = None
+        for uid in uids_sorted:
+            loss = losses_per_uid[uid][sample_idx]
+            if win_uid is None or loss < win_loss_adv:
+                win_uid = uid
+                win_loss_adv = loss * uid_advantage_factors[uid]
+        wins[win_uid] += 1
 
         # Determine winner in absolute sense
+        sample_loss = [losses_per_uid[uid][sample_idx] for uid in uids_sorted]
         abs_winner = np.argmin(sample_loss)
         abs_wins[uids_sorted[abs_winner]] += 1
 
@@ -166,12 +174,13 @@ def compute_losses_regular(
     model.to(device)
     model.eval()
 
-    losses = [math.inf]*len(batches) # Use infinity to indicate failure
+    losses = [np.nan]*len(batches) # Use NaN to indicate failure
     with torch.no_grad():
         cuda_errors = 0
         for i,batch in enumerate(batches):
             # None indicates the token sequence was too long or did not map back onto itself
             if batch is None:
+                losses[i] = math.inf
                 continue
 
             inputs = None
@@ -198,7 +207,7 @@ def compute_losses_regular(
             del inputs
             del logits
 
-    bt.logging.info(f'computed losses: {losses[:10]}...')
+    bt.logging.info(f'computed {len(losses)} losses: {losses[:10]}...')
 
     return losses
 
@@ -230,11 +239,13 @@ def compute_losses(
         gpu_ram = torch.cuda.get_device_properties(device).total_memory
         # The fraction below is somewhat arbitrary. The precise amount of ram
         # needed depends on many factors. TODO.
-        arbitrary_fraction = 0.65
+        arbitrary_fraction = 0.35
         use_gpu_ram = int(arbitrary_fraction * gpu_ram)
         if model_bytes > use_gpu_ram:
             # This assumes all slices are created equal, which isn't true.
             n_slices = (model_bytes+use_gpu_ram)//use_gpu_ram
+        elif model.device.type == 'meta':
+            n_slices = 1 # need to reload anyway
 
     if n_slices is None or test_sliced_eval:
         regular_losses = compute_losses_regular(model,batches,device)
