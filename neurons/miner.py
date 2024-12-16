@@ -39,10 +39,14 @@ load_dotenv()  # take environment variables from .env.
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TF32_OVERRIDE"] = "0"
+os.environ["PYTORCH_NVFUSER_ENABLE_BF16"] = "1"
 
 scaler = torch.amp.GradScaler("cuda")
 
+# Set to bfloat16
+torch_dtype = torch.bfloat16
 
 # === Config ===
 def get_config():
@@ -106,7 +110,7 @@ def get_config():
     parser.add_argument(
         "--pages_per_epoch",
         type=int,
-        default=10,
+        default=20,
         help="Number of pages trained on per epoch",
     )
     parser.add_argument(
@@ -132,13 +136,11 @@ async def load_starting_model(
     """Loads the model to train based on the provided config."""
     
     try:
-        model = LlamaForCausalLM.from_pretrained(path, torch_dtype = torch.float32)
+        model = LlamaForCausalLM.from_pretrained(path)
         return model
     except:
         modelConfig = LlamaConfig.from_pretrained("luaqi/sn29_back_v16")
 
-        modelConfig.torch_dtype = torch.float32
-        
         model = LlamaForCausalLM(modelConfig)
         return model
 
@@ -151,9 +153,37 @@ async def load_starting_tokenizer(
         tokenizer = AutoTokenizer.from_pretrained(path)
         return tokenizer
     except:
-        tokenizer = AutoTokenizer.from_pretrained("Xenova/gpt-4")
+        tokenizer = AutoTokenizer.from_pretrained("coldint/phi3_stock_tokenizer")
         tokenizer.save_pretrained(path)
         return tokenizer
+
+def freeze_layers(model, start_layer=1, end_layer=40):
+    """
+    Freezes the specified layers of the model by setting `requires_grad=False`.
+
+    Args:
+        model: The PyTorch model to modify.
+        start_layer: The first layer index to freeze (inclusive).
+        end_layer: The last layer index to freeze (inclusive).
+
+    Returns:
+        The model with the specified layers frozen.
+    """
+    # Ensure the model has a sequential or iterable structure for layers
+    if hasattr(model, 'layers'):  # For models with a `layers` attribute
+        layers = model.layers
+    elif hasattr(model, 'encoder') and hasattr(model.encoder, 'layers'):  # For transformer-style encoders
+        layers = model.encoder.layers
+    else:
+        raise ValueError("Model structure not recognized. Modify `freeze_layers` to access the correct layer hierarchy.")
+    
+    # Iterate over layers and freeze the specified range
+    for i, layer in enumerate(layers):
+        if start_layer <= i + 1 <= end_layer:  # PyTorch indices are 0-based, so adjust by +1
+            for param in layer.parameters():
+                param.requires_grad = False
+    
+    return model
 
 async def main(config: bt.config):
     bt.logging(config=config)
@@ -187,9 +217,14 @@ async def main(config: bt.config):
     # metadata_store = ChainModelMetadataStore(subtensor, None, config.netuid)
     tokenizer: AutoTokenizer = await load_starting_tokenizer(tokenizer_dir)
     model: LlamaForCausalLM = await load_starting_model(model_dir)
+    model.model = freeze_layers(model.model, start_layer=1, end_layer=40)
     if model is None or tokenizer is None:
         return False
-    model = model.train()
+    
+    for param in model.parameters():
+        param.requires_grad = True
+    
+    model = model.to(torch_dtype).train()
     model = model.to(config.device)
     # model = model.apply(lambda x: torch.utils.checkpoint.checkpoint(x))
 
@@ -198,13 +233,14 @@ async def main(config: bt.config):
     # model_utils.save_tokenizer(tokenizer, tokenizer_dir)
 
     # Build optimizer
-    optimizer = Adafactor(
-        model.parameters(), 
-        # lr=config.lr, 
-        warmup_init=True,
-        scale_parameter=True, 
-        relative_step=True
-    )
+    # optimizer = Adafactor(
+    #     model.parameters(), 
+    #     # lr=config.lr, 
+    #     warmup_init=True,
+    #     scale_parameter=True, 
+    #     relative_step=True
+    # )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wdecay)
     wandb_run = None
 
     # If using wandb, start a new run.
